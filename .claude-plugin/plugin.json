@@ -1,0 +1,19 @@
+{
+  "name": "skillcache",
+  "version": "0.1.0",
+  "description": "Standalone SkillCache compiler, sandbox gate verifier (Gate 1/2/3), warm capsule executor, and stdio MCP server for Claude Code and Codex.",
+  "author": {
+    "name": "AI-Infrastructure Contributors"
+  },
+  "homepage": "https://github.com/Alex-Caepio/skillcache",
+  "repository": "https://github.com/Alex-Caepio/skillcache",
+  "license": "Apache-2.0",
+  "keywords": [
+    "skillcache",
+    "capsules",
+    "sandbox",
+    "gate1",
+    "compiler",
+    "mcp"
+  ]
+}

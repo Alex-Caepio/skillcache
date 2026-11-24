@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "skillcache": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/skillcache-engine",
+      "args": ["mcp"]
+    }
+  }
+}

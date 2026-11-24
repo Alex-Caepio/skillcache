@@ -1,0 +1,873 @@
+//! Native platform profiles and in-sandbox discovery boundary probe.
+use crate::error::{HarnessError, Result};
+use crate::host::{provider, store};
+#[cfg(windows)]
+use serde_json::Map;
+use serde_json::{Value, json};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+};
+#[derive(Clone)]
+pub struct Spec {
+    pub workspace: PathBuf,
+    pub target: PathBuf,
+    pub protected: Vec<PathBuf>,
+    pub readable: Vec<PathBuf>,
+    pub accounts: Vec<PathBuf>,
+    pub runtime: Vec<PathBuf>,
+    pub codex: Option<PathBuf>,
+    pub evidence: Option<PathBuf>,
+    /// Whether the sandboxed process may use the network. Agents need their
+    /// provider's API; a capsule gate that runs only local programs does not.
+    pub network: bool,
+}
+/// What a sandbox is for, which decides how much of the host it shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Profile {
+    /// The whole filesystem read-only, the workspace writable.
+    Creator,
+    /// The operating system's runtime and the named folders only; the target
+    /// and the protected sources are denied.
+    Discovery,
+    /// The same minimal root for a process that is not an agent: no target
+    /// and no protected source take part.
+    Gate,
+}
+impl Profile {
+    fn minimal(self) -> bool {
+        self != Self::Creator
+    }
+}
+
+/// Returns whether a host environment variable looks like a secret/credential
+/// that should be scrubbed from sandboxed or check child processes.
+pub fn is_credential_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "PASSWORD"]
+        .iter()
+        .any(|part| upper.contains(part))
+}
+
+/// Scrubs credentials (`KEY`/`TOKEN`/`PASSWORD`) and `GIT_*` overrides from an
+/// inherited environment, enables non-interactive Git/Python defaults, and
+/// overlays caller-approved variables from `extra`.
+pub fn scrub_env(
+    inherited: impl IntoIterator<Item = (String, String)>,
+    extra: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    for (k, v) in inherited {
+        if k.starts_with("GIT_") || is_credential_var(&k) {
+            continue;
+        }
+        env.insert(k, v);
+    }
+    env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    env.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
+/// Returns whether the current OS exposes a supported non-agent sandbox binary.
+pub fn available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Path::new("/usr/bin/sandbox-exec").is_file()
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        provider::find_executable("bwrap").is_some()
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+/// Collects non-symlink parent binary directories required to resolve `argv[0]`
+/// inside `Profile::Gate`'s minimal root without exposing `$HOME` itself.
+pub fn runtime_dirs_for_argv(argv: &[String], path_env: Option<&str>) -> Vec<PathBuf> {
+    let Some(program) = argv.first().filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .and_then(|p| crate::custody::fs::canonicalize(Path::new(&p)).ok());
+    let mut candidates = Vec::new();
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        if let Some(parent) = program_path.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    } else {
+        if let Some(resolved) = provider::find_executable(program)
+            && let Some(parent) = resolved.parent()
+        {
+            candidates.push(parent.to_path_buf());
+        }
+        if let Some(path_env) = path_env {
+            for entry in std::env::split_paths(path_env) {
+                if entry.join(program).exists() {
+                    candidates.push(entry);
+                }
+            }
+        }
+    }
+    let os_roots = ["/usr", "/bin", "/sbin", "/lib", "/lib64"];
+    let mut out = Vec::new();
+    for dir in candidates {
+        let Ok(canon) = crate::custody::fs::canonicalize(&dir) else {
+            continue;
+        };
+        if !canon.is_dir()
+            || std::fs::symlink_metadata(&dir).is_ok_and(|m| crate::custody::fs::linked(&m))
+        {
+            continue;
+        }
+        if home.as_ref().is_some_and(|h| h == &canon) {
+            continue;
+        }
+        if os_roots.iter().any(|root| canon.starts_with(root)) {
+            continue;
+        }
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    out
+}
+fn canonical(path: &Path) -> Result<PathBuf> {
+    let root = crate::custody::fs::canonicalize(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if crate::custody::fs::linked(&meta) {
+        return Err(HarnessError::forbidden("Sandbox paths must not be links."));
+    }
+    Ok(root)
+}
+fn overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+fn arg(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(String::from)
+        .ok_or_else(|| HarnessError::invalid("Sandbox paths must be UTF-8."))
+}
+#[cfg(target_os = "macos")]
+fn sbpl(path: &Path) -> Result<String> {
+    Ok(format!(
+        "\"{}\"",
+        arg(path)?.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+#[cfg(windows)]
+fn toml(value: &Value) -> Result<String> {
+    match value {
+        Value::Object(map) => {
+            let mut entries = Vec::new();
+            for (k, v) in map {
+                entries.push(format!("{}={}", json!(k), toml(v)?));
+            }
+            Ok(format!("{{{}}}", entries.join(",")))
+        }
+        Value::Array(array) => Ok(format!(
+            "[{}]",
+            array
+                .iter()
+                .map(toml)
+                .collect::<Result<Vec<_>>>()?
+                .join(",")
+        )),
+        _ => Ok(value.to_string()),
+    }
+}
+fn prepared(spec: &Spec, kind: Profile) -> Result<Spec> {
+    let discovery = kind.minimal();
+    let mut spec = spec.clone();
+    if cfg!(windows) || kind != Profile::Gate {
+        spec.runtime.push(
+            trusted_helper(&spec.workspace)?
+                .parent()
+                .ok_or_else(|| HarnessError::invalid("Native helper parent missing."))?
+                .to_path_buf(),
+        );
+    }
+    spec.workspace = canonical(&spec.workspace)?;
+    spec.target = canonical(&spec.target)?;
+    if !spec.workspace.is_dir() || !spec.target.is_dir() {
+        return Err(HarnessError::invalid(
+            "Sandbox workspace and target must be directories.",
+        ));
+    }
+    spec.protected = spec
+        .protected
+        .iter()
+        .map(|p| canonical(p))
+        .collect::<Result<_>>()?;
+    spec.accounts = spec
+        .accounts
+        .iter()
+        .map(|p| canonical(p))
+        .collect::<Result<_>>()?;
+    spec.runtime = spec
+        .runtime
+        .iter()
+        .map(|p| canonical(p))
+        .collect::<Result<_>>()?;
+    spec.readable = spec
+        .readable
+        .iter()
+        .map(|p| canonical(p))
+        .collect::<Result<_>>()?;
+    if let Some(path) = &spec.evidence {
+        spec.evidence = Some(canonical(path)?);
+    }
+    let control = spec
+        .workspace
+        .parent()
+        .ok_or_else(|| HarnessError::invalid("Sandbox workspace needs a control parent."))?;
+    for account in &spec.accounts {
+        for protected in spec
+            .protected
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([spec.target.as_path(), control])
+        {
+            if overlap(account, protected) {
+                return Err(HarnessError::forbidden(
+                    "Provider account state overlaps a protected directory.",
+                ));
+            }
+        }
+    }
+    if discovery {
+        for source in &spec.protected {
+            for allowed in spec
+                .runtime
+                .iter()
+                .chain(spec.accounts.iter())
+                .chain(spec.readable.iter())
+                .map(PathBuf::as_path)
+                .chain([control])
+            {
+                if overlap(source, allowed) {
+                    return Err(HarnessError::forbidden(
+                        "Source folders overlap privileged runtime, account or control paths.",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(spec)
+}
+pub fn trusted_helper(workspace: &Path) -> Result<PathBuf> {
+    let workspace = canonical(workspace)?;
+    let control = workspace
+        .parent()
+        .ok_or_else(|| HarnessError::invalid("Sandbox workspace needs a control directory."))?;
+    crate::host::util::private_directory(control)?;
+    let executable = std::env::current_exe()?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| HarnessError::invalid("Native helper has no parent."))?;
+    let name = executable
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| HarnessError::invalid("Native helper filename is invalid."))?;
+    let mut source = crate::custody::publication::PublicationFiles::new(parent)?;
+    let (bytes, _identity) = source
+        .capture_source(name, 512 * 1024 * 1024)?
+        .ok_or_else(|| HarnessError::unavailable("The native helper is unavailable."))?;
+    let digest = store::sha(&bytes);
+    let filename = if cfg!(windows) {
+        "skillcache-engine.exe"
+    } else {
+        "skillcache-engine"
+    };
+    let relative = format!("native-helpers/{digest}/{filename}");
+    let mut destination = crate::custody::publication::PublicationFiles::new(control)?;
+    let previous = destination.read(&relative, 512 * 1024 * 1024)?;
+    if previous.as_ref().is_some_and(|old| old != &bytes) {
+        return Err(HarnessError::conflict("A pinned native helper changed."));
+    }
+    if previous.is_none() {
+        destination.write_expected_mode_checked(
+            &relative,
+            &bytes,
+            None,
+            None,
+            0o500,
+            512 * 1024 * 1024,
+        )?;
+    } else if destination.read_mode(&relative)? != Some(if cfg!(windows) { 0o444 } else { 0o500 }) {
+        destination.set_mode(&relative, 0o500)?;
+    }
+    source.check()?;
+    destination.check()?;
+    Ok(control.join(relative))
+}
+pub fn wrap(spec: &Spec, argv: &[String], kind: Profile) -> Result<Vec<String>> {
+    command(spec, argv, kind)
+}
+pub fn creator(spec: &Spec, argv: &[String]) -> Result<Vec<String>> {
+    command(spec, argv, Profile::Creator)
+}
+pub fn discovery(spec: &Spec, argv: &[String]) -> Result<Vec<String>> {
+    command(spec, argv, Profile::Discovery)
+}
+/// The command that runs `argv` for a capsule gate: the operating system's
+/// runtime, `spec.runtime` and `spec.readable` read-only, `spec.accounts` and
+/// the workspace writable, nothing else of the host, and the network only when
+/// `spec.network` says so. `spec.target` and `spec.protected` are not shown.
+/// The root is deliberately smaller than a session's: a program that needs a
+/// tool outside it fails here, in a gate, rather than later.
+pub fn gate(spec: &Spec, argv: &[String]) -> Result<Vec<String>> {
+    command(spec, argv, Profile::Gate)
+}
+fn command(spec: &Spec, argv: &[String], kind: Profile) -> Result<Vec<String>> {
+    if argv.is_empty() {
+        return Err(HarnessError::invalid("Sandbox native command is missing."));
+    }
+    let discovery = kind.minimal();
+    let spec = prepared(spec, kind)?;
+    let control = spec
+        .workspace
+        .parent()
+        .ok_or_else(|| HarnessError::invalid("Missing sandbox control parent."))?;
+    #[cfg(windows)]
+    {
+        let codex=spec.codex.as_ref().ok_or_else(||HarnessError::unavailable("Windows isolation requires native Codex with configured elevated permission profiles."))?;
+        let mut entries = Map::new();
+        entries.insert(
+            if discovery { ":minimal" } else { ":root" }.into(),
+            "read".into(),
+        );
+        for path in spec
+            .runtime
+            .iter()
+            .chain(spec.readable.iter())
+            .map(PathBuf::as_path)
+            .chain([control])
+        {
+            entries.insert(arg(path)?, "read".into());
+        }
+        for path in &spec.accounts {
+            entries.insert(arg(path)?, "write".into());
+        }
+        entries.insert(arg(&spec.workspace)?, "write".into());
+        if kind != Profile::Gate {
+            entries.insert(
+                arg(&spec.target)?,
+                if discovery { "deny" } else { "read" }.into(),
+            );
+            for path in &spec.protected {
+                entries.insert(arg(path)?, if discovery { "deny" } else { "read" }.into());
+            }
+        }
+        if let Some(evidence) = &spec.evidence {
+            entries.insert(arg(evidence)?, "read".into());
+        }
+        let name = format!(
+            "harness{}{}",
+            match kind {
+                Profile::Creator => "creator",
+                Profile::Discovery => "discovery",
+                Profile::Gate => "gate",
+            },
+            store::hexid()
+        );
+        let mut roots = Map::new();
+        roots.insert(arg(&spec.workspace)?, true.into());
+        let profile = json!({"filesystem":entries,"network":{"enabled":spec.network},"workspace_roots":roots});
+        let mut permissions = Map::new();
+        permissions.insert(name.clone(), profile);
+        let tmp = spec.workspace.join(".harness-tmp");
+        crate::custody::fs::ensure_directory(&tmp, true)?;
+        let mut out = provider::command_argv(&[arg(codex)?], Some("codex"))?;
+        out.extend([
+            "sandbox".into(),
+            "-c".into(),
+            "windows.sandbox=\"elevated\"".into(),
+            "-c".into(),
+            format!("permissions={}", toml(&permissions.into())?),
+            "-P".into(),
+            name,
+            "-C".into(),
+            arg(&spec.workspace)?,
+            "--include-managed-config".into(),
+            "--".into(),
+            arg(&trusted_helper(&spec.workspace)?)?,
+            "internal-sandbox-child".into(),
+            arg(&tmp)?,
+        ]);
+        out.extend_from_slice(argv);
+        Ok(out)
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(bwrap) = provider::find_executable("bwrap") {
+            if kind != Profile::Gate {
+                // The private scratch folder exists on Creator/Discovery: the discovery
+                // probe proves the workspace is writable by creating a file in it.
+                // Gate on Linux mounts `--tmpfs /tmp` directly and avoids polluting clean
+                // workspaces or git worktrees with `.harness-tmp`.
+                crate::custody::fs::ensure_directory(&spec.workspace.join(".harness-tmp"), true)?;
+            }
+            let mut out = vec![
+                arg(&bwrap)?,
+                "--die-with-parent".into(),
+                "--new-session".into(),
+                "--unshare-pid".into(),
+            ];
+            if !spec.network {
+                out.push("--unshare-net".into());
+            }
+            let public = [
+                "/usr",
+                "/bin",
+                "/sbin",
+                "/lib",
+                "/lib64",
+                "/etc/ssl/certs",
+                "/etc/pki/tls/certs",
+                "/etc/ca-certificates",
+                "/etc/ld.so.cache",
+                "/etc/ld.so.conf",
+                "/etc/nsswitch.conf",
+                "/etc/passwd",
+                "/etc/group",
+                "/etc/hosts",
+                "/etc/resolv.conf",
+            ];
+            if discovery {
+                for name in public {
+                    let path = Path::new(name);
+                    if path.exists() {
+                        let resolved = crate::custody::fs::canonicalize(path)?;
+                        if spec.protected.iter().any(|p| overlap(p, &resolved)) {
+                            return Err(HarnessError::forbidden(
+                                "Source folders must be outside OS runtime directories.",
+                            ));
+                        }
+                        out.extend(["--ro-bind".into(), name.into(), name.into()]);
+                    }
+                }
+                if kind == Profile::Discovery {
+                    for path in spec.runtime.iter().chain(spec.readable.iter()) {
+                        let name = arg(path)?;
+                        out.extend(["--ro-bind".into(), name.clone(), name]);
+                    }
+                }
+            } else {
+                out.extend(["--ro-bind", "/", "/"].map(String::from));
+            }
+            out.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"].map(String::from));
+            if kind == Profile::Gate {
+                // After the private `/tmp`, so that a named folder below the
+                // host's `/tmp` is still the one the gate reads.
+                for path in spec.runtime.iter().chain(spec.readable.iter()) {
+                    let name = arg(path)?;
+                    out.extend(["--ro-bind".into(), name.clone(), name]);
+                }
+            }
+            for path in &spec.accounts {
+                let name = arg(path)?;
+                out.extend(["--bind".into(), name.clone(), name]);
+            }
+            let control = arg(control)?;
+            out.extend(["--ro-bind".into(), control.clone(), control]);
+            let workspace = arg(&spec.workspace)?;
+            out.extend(["--bind".into(), workspace.clone(), workspace.clone()]);
+            if !discovery {
+                for path in spec.protected.iter().chain([&spec.target]) {
+                    let name = arg(path)?;
+                    out.extend(["--ro-bind".into(), name.clone(), name]);
+                }
+            }
+            if let Some(evidence) = &spec.evidence {
+                let name = arg(evidence)?;
+                out.extend(["--ro-bind".into(), name.clone(), name]);
+            }
+            out.extend(["--chdir".into(), workspace, "--".into()]);
+            out.extend_from_slice(argv);
+            return Ok(out);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let sandbox = Path::new("/usr/bin/sandbox-exec");
+            if !sandbox.is_file() {
+                return Err(HarnessError::unavailable(
+                    "macOS isolation requires sandbox-exec.",
+                ));
+            }
+            let mut profile = if discovery {
+                "(version 1)\n(allow default)\n(deny file-read*)\n(deny file-write*)\n".to_string()
+            } else {
+                "(version 1)\n(allow default)\n(deny file-write*)\n".into()
+            };
+            let public = [
+                "/usr",
+                "/bin",
+                "/sbin",
+                "/System",
+                "/Library/Apple",
+                "/private/etc/ssl",
+                "/private/etc/hosts",
+                "/private/etc/resolv.conf",
+                "/dev",
+            ];
+            if discovery {
+                for name in public {
+                    let path = Path::new(name);
+                    if path.exists() {
+                        if spec.protected.iter().any(|p| overlap(p, path)) {
+                            return Err(HarnessError::forbidden(
+                                "Source folders must be outside OS runtime directories.",
+                            ));
+                        }
+                        profile
+                            .push_str(&format!("(allow file-read* (subpath {}))\n", sbpl(path)?));
+                    }
+                }
+                for path in spec
+                    .runtime
+                    .iter()
+                    .chain(spec.readable.iter())
+                    .chain(spec.accounts.iter())
+                    .map(PathBuf::as_path)
+                    .chain([control])
+                {
+                    profile.push_str(&format!("(allow file-read* (subpath {}))\n", sbpl(path)?));
+                }
+            }
+            for path in spec.accounts.iter().chain([&spec.workspace]) {
+                profile.push_str(&format!("(allow file-write* (subpath {}))\n", sbpl(path)?));
+            }
+            if !discovery {
+                for path in spec.protected.iter().chain([&spec.target]) {
+                    profile.push_str(&format!("(deny file-write* (subpath {}))\n", sbpl(path)?));
+                }
+            }
+            if let Some(evidence) = &spec.evidence {
+                profile.push_str(&format!(
+                    "(deny file-write* (subpath {}))\n",
+                    sbpl(evidence)?
+                ));
+            }
+            if !spec.network {
+                profile.push_str("(deny network*)\n");
+            }
+            let path = control.join(format!(
+                "sandbox-{}.sb",
+                &store::sha(profile.as_bytes())[..16]
+            ));
+            crate::custody::fs::atomic_write(&path, profile.as_bytes())?;
+            let tmp = spec.workspace.join(".harness-tmp");
+            crate::custody::fs::ensure_directory(&tmp, true)?;
+            let mut out = vec![
+                arg(sandbox)?,
+                "-f".into(),
+                arg(&path)?,
+                "--".into(),
+                "/usr/bin/env".into(),
+            ];
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                out.push(format!("{key}={}", tmp.display()));
+            }
+            out.extend_from_slice(argv);
+            return Ok(out);
+        }
+        Err(HarnessError::unavailable(
+            "AI isolation requires bubblewrap on Linux or sandbox-exec on macOS; unrestricted fallback is refused.",
+        ))
+    }
+}
+pub fn child_entry(arguments: &[String]) -> Result<i32> {
+    let (tmp, argv) = arguments
+        .split_first()
+        .ok_or_else(|| HarnessError::invalid("Missing private temporary directory."))?;
+    let (executable, args) = argv
+        .split_first()
+        .ok_or_else(|| HarnessError::invalid("Missing sandbox child command."))?;
+    let tmp = canonical(Path::new(tmp))?;
+    let mut child = std::process::Command::new(executable);
+    child.args(args);
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        child.env(key, &tmp);
+    }
+    Ok(child.status()?.code().unwrap_or(1))
+}
+fn readable(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok() || std::fs::File::open(path).is_ok()
+}
+/// Runs inside the discovery sandbox. Every outcome, failure included, is one JSON
+/// line on stdout: the caller never sees this process's stderr, so a refusal must
+/// name its own reason there.
+pub fn probe_entry(arguments: &[String]) -> Result<i32> {
+    // A malformed invocation is a usage error (exit 2) like any internal
+    // command's; only a check that ran reports its refusal as a JSON line.
+    if arguments.len() != 3 {
+        return Err(HarnessError::invalid("Missing discovery probe paths."));
+    }
+    match probe(arguments) {
+        Ok(receipt) => {
+            println!("{receipt}");
+            Ok(0)
+        }
+        Err(error) => {
+            println!("{}", json!({"ok":false,"error":error.to_string()}));
+            Ok(1)
+        }
+    }
+}
+fn probe(arguments: &[String]) -> Result<Value> {
+    if arguments.len() != 3 {
+        return Err(HarnessError::invalid("Missing discovery probe paths."));
+    }
+    let listing = crate::custody::fs::read_text(Path::new(&arguments[0])).map_err(|_| {
+        HarnessError::unavailable("The sandbox could not read the list of paths to check.")
+    })?;
+    if listing.len() > 32 * 1024 * 1024 {
+        return Err(HarnessError::invalid(
+            "Boundary path listing exceeds its limit.",
+        ));
+    }
+    let mut allowed = false;
+    let mut count = 0;
+    let mut denied_count = 0;
+    let mut allowed_count = 0;
+    for line in listing.lines() {
+        if line == "--readable" {
+            allowed = true;
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > 100_100 {
+            return Err(HarnessError::invalid(
+                "Boundary path count exceeds its limit.",
+            ));
+        }
+        if allowed {
+            allowed_count += 1;
+        } else {
+            denied_count += 1;
+        }
+        let can = readable(Path::new(line));
+        if !allowed && can {
+            return Err(HarnessError::forbidden(format!(
+                "The sandbox could read an original file or folder: {line}"
+            )));
+        }
+        if allowed && !can {
+            return Err(HarnessError::unavailable(
+                "The sandbox could not read captured evidence.",
+            ));
+        }
+    }
+    let workspace = Path::new(&arguments[1]);
+    let evidence = Path::new(&arguments[2]);
+    let scratch = workspace
+        .join(".harness-tmp")
+        .join(format!("probe-{}", store::hexid()));
+    std::fs::write(&scratch, b"workspace probe")
+        .and_then(|()| std::fs::remove_file(&scratch))
+        .map_err(|error| {
+            HarnessError::unavailable(format!(
+                "The sandbox workspace is not writable ({}): {error}",
+                scratch.display()
+            ))
+        })?;
+    let denied = evidence.join(format!("probe-{}", store::hexid()));
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&denied)
+    {
+        Ok(mut file) => {
+            let _ = file.write_all(b"evidence probe");
+            drop(file);
+            let _ = std::fs::remove_file(denied);
+            Err(HarnessError::forbidden(
+                "The sandbox could change captured evidence.",
+            ))
+        }
+        Err(_) => Ok(
+            json!({"ok":true,"denied":denied_count,"allowed":allowed_count,"evidence_read_only":true,"workspace_writable":true}),
+        ),
+    }
+}
+pub fn original_paths(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    fn visit(path: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<()> {
+        if depth > 64 || out.len() >= 100_000 {
+            return Err(HarnessError::invalid(
+                "Discovery boundary enumeration exceeds its limit.",
+            ));
+        }
+        out.push(path.into());
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.is_dir() && !crate::custody::fs::linked(&meta) {
+            let mut entries = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                visit(&entry.path(), depth + 1, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        if roots
+            .iter()
+            .any(|other| other != root && root.starts_with(other))
+        {
+            continue;
+        }
+        visit(root, 0, &mut out)?;
+    }
+    Ok(out)
+}
+pub struct BoundaryRequest {
+    pub sentinel: PathBuf,
+    pub listing: PathBuf,
+    pub command: Vec<String>,
+    pub denied: usize,
+    pub allowed: usize,
+}
+impl Drop for BoundaryRequest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.listing);
+        let _ = std::fs::remove_file(&self.sentinel);
+    }
+}
+pub fn boundary_request(spec: &Spec) -> Result<BoundaryRequest> {
+    boundary_request_for(spec, original_paths(&spec.protected)?)
+}
+/// As [`boundary_request`], for a caller that names the paths the sandbox must
+/// not read itself. A project of any size can then be checked by its root and
+/// a bounded sample of what lies below it, instead of by every file.
+pub fn boundary_request_for(spec: &Spec, denied: Vec<PathBuf>) -> Result<BoundaryRequest> {
+    boundary_request_with(spec, denied, None)
+}
+/// As [`boundary_request_for`], with the executable that runs the in-sandbox
+/// check named by the caller. A process that embeds this library and cannot
+/// serve `internal-discovery-probe` itself, such as a test binary, names an
+/// engine that can; `None` is this executable's pinned copy.
+pub fn boundary_request_with(
+    spec: &Spec,
+    denied: Vec<PathBuf>,
+    helper: Option<&Path>,
+) -> Result<BoundaryRequest> {
+    let workspace = canonical(&spec.workspace)?;
+    let evidence = spec
+        .evidence
+        .as_ref()
+        .ok_or_else(|| HarnessError::invalid("Discovery evidence directory is missing."))?;
+    let control = workspace
+        .parent()
+        .ok_or_else(|| HarnessError::invalid("Discovery control directory is missing."))?;
+    let mut lines = denied
+        .into_iter()
+        .map(|p| arg(&p))
+        .collect::<Result<Vec<_>>>()?;
+    let denied = lines.len() + 1;
+    let sentinel =
+        std::env::temp_dir().join(format!("harness-discovery-sentinel-{}", store::hexid()));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&sentinel)?;
+    crate::host::util::private_file(&sentinel)?;
+    lines.push(arg(&sentinel)?);
+    lines.push("--readable".into());
+    let mut allowed = 0;
+    for entry in std::fs::read_dir(evidence)?.take(3) {
+        lines.push(arg(&entry?.path())?);
+        allowed += 1;
+    }
+    let listing = control.join(format!("boundary-paths-{}.txt", store::hexid()));
+    crate::custody::fs::atomic_write(&listing, format!("{}\n", lines.join("\n")).as_bytes())?;
+    let mut receipt = BoundaryRequest {
+        sentinel,
+        listing,
+        command: vec![],
+        denied,
+        allowed,
+    };
+    let argv = vec![
+        match helper {
+            Some(helper) => arg(helper)?,
+            None => arg(&trusted_helper(&workspace)?)?,
+        },
+        "internal-discovery-probe".into(),
+        arg(&receipt.listing)?,
+        arg(&workspace)?,
+        arg(evidence)?,
+    ];
+    receipt.command = discovery(spec, &argv)?;
+    Ok(receipt)
+}
+
+#[cfg(test)]
+mod generalize_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn scrub_env_withholds_secrets_and_git_overrides() {
+        let inherited = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "sk-secret".to_owned()),
+            ("github_token".to_owned(), "ghp_secret".to_owned()),
+            ("DB_PASSWORD".to_owned(), "hunter2".to_owned()),
+            ("GIT_DIR".to_owned(), "/tmp/evil".to_owned()),
+            ("LANG".to_owned(), "C.UTF-8".to_owned()),
+        ];
+        let extra = BTreeMap::from([("CUSTOM_FLAG".to_owned(), "1".to_owned())]);
+        let scrubbed = scrub_env(inherited, &extra);
+        assert_eq!(scrubbed.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(scrubbed.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            scrubbed.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            scrubbed.get("PYTHONDONTWRITEBYTECODE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(scrubbed.get("CUSTOM_FLAG").map(String::as_str), Some("1"));
+        assert!(!scrubbed.contains_key("OPENAI_API_KEY"));
+        assert!(!scrubbed.contains_key("github_token"));
+        assert!(!scrubbed.contains_key("DB_PASSWORD"));
+        assert!(!scrubbed.contains_key("GIT_DIR"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gate_wrap_never_creates_harness_tmp_in_workspace() {
+        if !available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = crate::custody::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("repo");
+        std::fs::create_dir_all(&ws).unwrap();
+        let spec = Spec {
+            workspace: ws.clone(),
+            target: ws.clone(),
+            protected: vec![],
+            readable: vec![],
+            accounts: vec![],
+            runtime: vec![],
+            codex: None,
+            evidence: None,
+            network: false,
+        };
+        let cmd = wrap(&spec, &["/bin/true".into()], Profile::Gate).unwrap();
+        assert!(cmd.contains(&"--unshare-net".to_owned()));
+        assert!(!ws.join(".harness-tmp").exists());
+    }
+}

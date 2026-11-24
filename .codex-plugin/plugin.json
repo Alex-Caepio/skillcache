@@ -1,0 +1,42 @@
+{
+  "name": "skillcache",
+  "version": "0.1.0",
+  "description": "Standalone SkillCache compiler, sandbox gate verifier (Gate 1/2/3), warm capsule executor, and stdio MCP server for Claude Code and Codex.",
+  "author": {
+    "name": "AI-Infrastructure Contributors"
+  },
+  "homepage": "https://github.com/Alex-Caepio/skillcache",
+  "repository": "https://github.com/Alex-Caepio/skillcache",
+  "license": "Apache-2.0",
+  "keywords": [
+    "skillcache",
+    "capsules",
+    "sandbox",
+    "gate1",
+    "compiler",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "interface": {
+    "displayName": "SkillCache",
+    "shortDescription": "Verified warm skill compilation, sandboxed Gate 1/2/3 checks, and capsule lifecycle",
+    "longDescription": "Compiles observed agent skill traces into sealed hybrid or textual capsules, validates static dataflow and secrets via Gate 1, executes isolated --unshare-net / sandbox-exec checks via Gate 2 & Gate 3 replay, manages capsule invalidation/requalification/retirement in private SQLite state, and exposes multicall skillcache-run / skillcache-tool execution plus a 2025-06-18 stdio MCP server.",
+    "developerName": "AI-Infrastructure Contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/Alex-Caepio/skillcache",
+    "defaultPrompt": [
+      "Check SkillCache readiness and active capsules for this repository.",
+      "Run Gate 1 validation on a capsule package directory.",
+      "Compile or requalify a SkillCache capsule for this repository."
+    ],
+    "brandColor": "#0284C7",
+    "composerIcon": "./assets/logo.svg",
+    "logo": "./assets/logo.svg",
+    "screenshots": []
+  }
+}

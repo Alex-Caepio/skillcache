@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "skillcache": {
+      "command": "./bin/skillcache-engine",
+      "args": ["mcp"],
+      "cwd": ".",
+      "tool_timeout_sec": 120
+    }
+  }
+}
