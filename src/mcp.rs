@@ -240,7 +240,8 @@ fn resolve_input_file(base: Option<&Path>, raw: &str) -> Result<PathBuf> {
         }
         raw_cwd.join(candidate)
     };
-    if custody::inside_plugin_dir(&resolved) {
+    let resolved_canon = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    if custody::inside_plugin_dir(&resolved) || custody::inside_plugin_dir(&resolved_canon) {
         return Err(HarnessError::coded(
             crate::error::ErrorKind::Policy,
             "plugin-cwd",
@@ -262,17 +263,19 @@ fn resolve_state_dir(args: &Value) -> Result<Option<PathBuf>> {
     let abs = if path.is_absolute() {
         path
     } else {
-        let cwd = std::env::current_dir()?;
-        if custody::inside_plugin_dir(&cwd) {
+        let raw_cwd = std::env::current_dir()?;
+        let canon_cwd = std::fs::canonicalize(&raw_cwd).unwrap_or_else(|_| raw_cwd.clone());
+        if custody::inside_plugin_dir(&raw_cwd) || custody::inside_plugin_dir(&canon_cwd) {
             return Err(HarnessError::coded(
                 crate::error::ErrorKind::Policy,
                 "plugin-cwd",
                 "Refusing relative state_dir inside the skillcache plugin directory.",
             ));
         }
-        cwd.join(path)
+        raw_cwd.join(path)
     };
-    if custody::inside_plugin_dir(&abs) {
+    let abs_canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+    if custody::inside_plugin_dir(&abs) || custody::inside_plugin_dir(&abs_canon) {
         return Err(HarnessError::coded(
             crate::error::ErrorKind::Policy,
             "plugin-cwd",

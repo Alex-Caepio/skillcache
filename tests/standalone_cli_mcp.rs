@@ -569,3 +569,125 @@ fn mcp_exposes_9_tools_enforces_plugin_cwd_guard_and_runs_lifecycle() {
     assert!(exit.success());
     skillcache::core::package::release(dir.path());
 }
+
+#[test]
+fn mcp_enforces_plugin_cwd_guard_in_antigravity_gemini_cache_and_manifests() {
+    let dir = TempDir::new().unwrap();
+    let fake_gemini_ext = dir.path().join(".gemini/config/plugins/skillcache");
+    std::fs::create_dir_all(&fake_gemini_ext).unwrap();
+    std::fs::write(fake_gemini_ext.join("plugin.json"), "{}").unwrap();
+    std::fs::write(fake_gemini_ext.join("mcp_config.json"), "{}").unwrap();
+
+    let agy_standalone = dir.path().join("agy-ext-root");
+    std::fs::create_dir_all(agy_standalone.join(".antigravity-plugin")).unwrap();
+    std::fs::create_dir_all(agy_standalone.join("bin")).unwrap();
+    std::fs::write(agy_standalone.join(".antigravity-plugin/plugin.json"), "{}").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        engine_bin(),
+        agy_standalone.join("bin/skillcache-engine"),
+    )
+    .unwrap();
+
+    let state_dir = dir.path().join("state");
+    let ws = dir.path().join("target-repo");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    for cwd in [&fake_gemini_ext, &agy_standalone] {
+        let mut child = Command::new(engine_bin())
+            .arg("mcp")
+            .current_dir(cwd)
+            .env("SKILLCACHE_STATE_DIR", &state_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdin = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+        let init = mcp_rpc(
+            &mut stdin,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "antigravity-test", "version": "1.0"}
+                }
+            }),
+        );
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+
+        for args in [json!({}), json!({"project": "."}), json!({"project": "./."})] {
+            let refused = mcp_rpc(
+                &mut stdin,
+                &mut reader,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "skillcache_status", "arguments": args}
+                }),
+            );
+            assert_eq!(refused["result"]["isError"], true, "{refused}");
+            assert_eq!(
+                refused["result"]["structuredContent"]["code"],
+                "plugin-cwd",
+                "{refused}"
+            );
+        }
+
+        let gate1_refused = mcp_rpc(
+            &mut stdin,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "skillcache_gate1",
+                    "arguments": {"package_dir": "."}
+                }
+            }),
+        );
+        assert_eq!(gate1_refused["result"]["isError"], true);
+        assert_eq!(
+            gate1_refused["result"]["structuredContent"]["code"],
+            "plugin-cwd"
+        );
+
+        let ok_status = mcp_rpc(
+            &mut stdin,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "skillcache_status",
+                    "arguments": {"project": ws.to_str().unwrap()}
+                }
+            }),
+        );
+        assert_eq!(ok_status["result"]["isError"], false, "{ok_status}");
+        assert!(ok_status["result"]["structuredContent"]["project_id"].is_string());
+
+        drop(stdin);
+        let exit = child.wait().unwrap();
+        assert!(exit.success());
+    }
+
+    skillcache::core::package::release(dir.path());
+}

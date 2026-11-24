@@ -81,16 +81,50 @@ pub fn absolute_lexical(path: &Path) -> Result<PathBuf> {
     Ok(normalize_lexical(&joined))
 }
 
-/// Return true when `path` is a packaged `skillcache` plugin (or marketplace cache) directory.
+/// Return true when `path` is a packaged `skillcache` plugin (or Antigravity/Claude/Codex extension) directory.
 pub fn is_plugin_dir(path: &Path) -> bool {
-    (path.join(".codex-plugin/plugin.json").is_file()
-        || path.join(".claude-plugin/plugin.json").is_file())
-        && path.join("bin/skillcache-engine").is_file()
+    let has_manifest = path.join(".codex-plugin/plugin.json").is_file()
+        || path.join(".claude-plugin/plugin.json").is_file()
+        || path.join(".antigravity-plugin/plugin.json").is_file()
+        || path.join(".gemini-plugin/plugin.json").is_file()
+        || path.join("plugin.json").is_file()
+        || path.join("mcp_config.json").is_file()
+        || path.join(".mcp.json").is_file();
+    let has_engine = path.join("bin/skillcache-engine").is_file()
+        || path.join("bin/skillcache-engine.exe").is_file();
+    has_manifest && has_engine
 }
 
-/// Return true when `start` resides inside a packaged plugin directory before reaching `.git`.
+fn has_component_subseq(path: &Path, seq: &[&str]) -> bool {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    parts.windows(seq.len()).any(|w| {
+        w.iter()
+            .zip(seq.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Return true when a normalized path resides inside an Antigravity/Claude/Codex plugin cache directory.
+pub fn looks_like_plugin_cache(path: &Path) -> bool {
+    let abs = absolute_lexical(path).unwrap_or_else(|_| path.to_path_buf());
+    has_component_subseq(&abs, &[".gemini", "config", "plugins"])
+        || has_component_subseq(&abs, &[".antigravity", "plugins"])
+        || has_component_subseq(&abs, &[".claude", "plugins", "cache"])
+        || has_component_subseq(&abs, &[".codex", "plugins", "cache"])
+}
+
+/// Return true when `start` resides inside a packaged plugin directory or cache before reaching `.git`.
 pub fn inside_plugin_dir(start: &Path) -> bool {
     let abs = absolute_lexical(start).unwrap_or_else(|_| start.to_path_buf());
+    if looks_like_plugin_cache(&abs) {
+        return true;
+    }
     for ancestor in abs.ancestors() {
         if is_plugin_dir(ancestor) {
             return true;
@@ -177,4 +211,48 @@ pub fn resolve_project_path(project: Option<&str>) -> Result<PathBuf> {
         ));
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn antigravity_plugin_markers_require_engine_and_cache_paths_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+
+        for marker in [
+            ".antigravity-plugin/plugin.json",
+            ".gemini-plugin/plugin.json",
+            "plugin.json",
+            "mcp_config.json",
+            ".mcp.json",
+            ".claude-plugin/plugin.json",
+            ".codex-plugin/plugin.json",
+        ] {
+            let root = tmp.path().join(marker.replace(['/', '.'], "_"));
+            let marker_path = root.join(marker);
+            std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+            std::fs::write(&marker_path, "{}").unwrap();
+            assert!(!is_plugin_dir(&root), "{marker} alone must not trigger without bin/skillcache-engine");
+
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::fs::write(root.join("bin/skillcache-engine"), "").unwrap();
+            assert!(is_plugin_dir(&root), "{marker} + bin/skillcache-engine must match");
+            assert!(inside_plugin_dir(&root.join("nested/sub")));
+        }
+
+        let cache_dir = tmp.path().join(".gemini/config/plugins/skillcache");
+        std::fs::create_dir_all(cache_dir.join("skills/compile")).unwrap();
+        assert!(looks_like_plugin_cache(&cache_dir));
+        assert!(inside_plugin_dir(&cache_dir));
+        assert!(inside_plugin_dir(&cache_dir.join("skills/compile")));
+
+        let normalized = tmp.path().join(".gemini/config/foo/../plugins/skillcache");
+        assert!(inside_plugin_dir(&normalized));
+
+        let agy_cache = tmp.path().join(".antigravity/plugins/skillcache");
+        assert!(inside_plugin_dir(&agy_cache));
+    }
 }
